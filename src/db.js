@@ -9,13 +9,32 @@ function createPool(connectionString) {
   return new Pool({ connectionString });
 }
 
+function ddlHint(err) {
+  return err.code === '42501'
+    ? ' (this database role cannot run DDL: apply the migration with the LingCode Cloud migration tool, then restart)'
+    : '';
+}
+
 // Applies each migrations/*.sql file once, in filename order, each in its own transaction.
+//
+// On LingCode Cloud the app's database role cannot run DDL, so migrations are applied
+// there with the Cloud migration tool (which also records them in schema_migrations).
+// This function then finds nothing pending and runs no DDL at all. Note that Postgres
+// checks CREATE permission before IF NOT EXISTS, hence the explicit existence check.
 async function migrate(pool) {
-  await pool.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
-    name text PRIMARY KEY,
-    applied_at timestamptz NOT NULL DEFAULT now()
-  )`);
-  const files = (await fs.readdir(MIGRATIONS_DIR)).filter((f) => f.endsWith('.sql')).sort();
+  const { rows: [{ exists }] } = await pool.query(
+    "SELECT to_regclass('schema_migrations') IS NOT NULL AS exists",
+  );
+  if (!exists) {
+    await pool.query(`CREATE TABLE schema_migrations (
+      name text PRIMARY KEY,
+      applied_at timestamptz NOT NULL DEFAULT now()
+    )`).catch((err) => {
+      throw new Error(`creating schema_migrations failed: ${err.message}${ddlHint(err)}`);
+    });
+  }
+  const done = new Set((await pool.query('SELECT name FROM schema_migrations')).rows.map((r) => r.name));
+  const files = (await fs.readdir(MIGRATIONS_DIR)).filter((f) => f.endsWith('.sql') && !done.has(f)).sort();
   const applied = [];
   for (const file of files) {
     const client = await pool.connect();
@@ -32,7 +51,7 @@ async function migrate(pool) {
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');
-      throw new Error(`migration ${file} failed: ${err.message}`);
+      throw new Error(`migration ${file} failed: ${err.message}${ddlHint(err)}`);
     } finally {
       client.release();
     }

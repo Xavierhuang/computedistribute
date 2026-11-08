@@ -9,7 +9,8 @@ async function main() {
   if (applied.length) console.log(`Applied migrations: ${applied.join(', ')}`);
 
   const app = createApp({ pool, leaseSeconds: config.leaseSeconds });
-  const server = app.listen(config.port, () => {
+  // Bind all interfaces: LingCode hosted apps must listen on 0.0.0.0:$PORT.
+  const server = app.listen(config.port, '0.0.0.0', () => {
     console.log(`computedistribute API listening on port ${config.port}`);
   });
 

@@ -22,10 +22,12 @@ See `reports/Spare compute marketplace research.md` for the market research behi
 Requires Node 22.9+ and Postgres 16.
 
 ```sh
-# One-time: a project-local Postgres on port 54329 (data in .pgdata/, gitignored)
+# One-time: a local Postgres on port 54329. Keep its data OUTSIDE the project:
+# the Cloud deploy uploads this folder (max 500 files).
 export LC_ALL=en_US.UTF-8
-initdb -D .pgdata -U postgres --auth=trust -E UTF8
-pg_ctl -D .pgdata -o "-p 54329 -k /tmp" -l .pgdata/server.log -w start
+PGDATA_DIR="$HOME/.local/share/computedistribute/pgdata"
+initdb -D "$PGDATA_DIR" -U postgres --auth=trust -E UTF8
+pg_ctl -D "$PGDATA_DIR" -o "-p 54329 -k /tmp" -l "$PGDATA_DIR/server.log" -w start
 createdb -h /tmp -p 54329 -U postgres computedistribute
 createdb -h /tmp -p 54329 -U postgres computedistribute_test
 
@@ -63,6 +65,22 @@ All requests need `Authorization: Bearer <api key>`. Buyer and host keys can't b
 | host | `POST /v1/host/leases/:leaseId/fail` | Report `{error, retryable}` |
 
 Lease endpoints return `409 lease_lost` when the job was canceled, reassigned or already finished. The worker should then drop the job.
+
+## Deployment (LingCode Cloud)
+
+Live at https://computedistribute-7e117eb4.apps.lingcode.app as a hosted Node 22 app
+(`Procfile`) on backend `4e7bcfd36af1bad36f010c43`. It reads `DATABASE_URL`, which the
+platform injects.
+
+- **Migrations:** the app's database role cannot run DDL. Apply each new
+  `migrations/*.sql` file with the Cloud migration tool, together with
+  `INSERT INTO schema_migrations (name) VALUES ('<file>')`, *before* redeploying.
+  On boot the app sees nothing pending and runs no DDL.
+- **RLS** is enabled on every table with no policies, so the public anon key can't read
+  `api_keys` or `jobs`. The app's own role still has access. Keep it that way.
+- **Accounts:** `scripts/create-account.js` needs direct database access, which isn't
+  available from outside. On Cloud, insert the account and the SHA-256 hash of a new
+  key through the migration tool. (An admin endpoint would replace this.)
 
 ## Not built yet
 
