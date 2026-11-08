@@ -4,6 +4,7 @@ const { createPool, migrate } = require('../src/db');
 const { createAccount } = require('../src/auth');
 const { createApp } = require('../src/app');
 const { reapExpiredLeases } = require('../src/queue');
+const { addEntry } = require('../src/ledger');
 
 const DB_URL = process.env.TEST_DATABASE_URL || 'postgresql://postgres@127.0.0.1:54329/computedistribute_test';
 
@@ -26,7 +27,7 @@ after(async () => {
 });
 
 beforeEach(async () => {
-  await pool.query('TRUNCATE jobs, workers, api_keys, accounts CASCADE');
+  await pool.query('TRUNCATE jobs, workers, api_keys, accounts, ledger_entries, users, sessions, payout_requests, verifications CASCADE');
 });
 
 async function call(key, method, path, body, headers = {}) {
@@ -39,12 +40,17 @@ async function call(key, method, path, body, headers = {}) {
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
-async function setup({ vramGb = 24 } = {}) {
-  const buyer = (await createAccount(pool, { name: 'buyer', kind: 'buyer' })).apiKey;
-  const host = (await createAccount(pool, { name: 'host', kind: 'host' })).apiKey;
-  const worker = await call(host, 'POST', '/v1/host/workers', { name: 'rig-1', job_types: ['echo'], vram_gb: vramGb });
+async function grant(accountId, usd) {
+  await addEntry(pool, { accountId, amountMicros: Math.round(usd * 1e6), kind: 'grant', memo: 'test' });
+}
+
+async function setup({ vramGb = 24, credit = 0, jobTypes = ['echo'] } = {}) {
+  const buyerAcct = await createAccount(pool, { name: 'buyer', kind: 'buyer' });
+  const hostAcct = await createAccount(pool, { name: 'host', kind: 'host' });
+  if (credit) await grant(buyerAcct.account.id, credit);
+  const worker = await call(hostAcct.apiKey, 'POST', '/v1/host/workers', { name: 'rig-1', job_types: jobTypes, vram_gb: vramGb });
   assert.equal(worker.status, 201);
-  return { buyer, host, workerId: worker.body.id };
+  return { buyer: buyerAcct.apiKey, host: hostAcct.apiKey, workerId: worker.body.id, buyerId: buyerAcct.account.id, hostId: hostAcct.account.id };
 }
 
 const submit = (key, extra = {}, headers) =>
@@ -213,7 +219,7 @@ test('validation rejects bad input with 400 and bad ids with 404', async () => {
 });
 
 test('transcribe: validates input and defaults min_vram_gb from the model', async () => {
-  const { buyer } = await setup();
+  const { buyer } = await setup({ credit: 10 });
   const t = (input) => call(buyer, 'POST', '/v1/jobs', { type: 'transcribe', input });
   for (const [input, why] of [
     [{}, 'missing url'],
@@ -239,7 +245,7 @@ test('transcribe: validates input and defaults min_vram_gb from the model', asyn
 });
 
 test('PUT /workers/:id updates job types so a reused worker can take new work', async () => {
-  const { buyer, host, workerId } = await setup({ vramGb: 0 });
+  const { buyer, host, workerId } = await setup({ vramGb: 0, credit: 10 });
   const job = await call(buyer, 'POST', '/v1/jobs', { type: 'transcribe', input: { audio_url: 'https://example.com/a.mp3' } });
   assert.equal((await claim(host, workerId)).status, 204, 'echo-only worker without VRAM gets nothing');
 

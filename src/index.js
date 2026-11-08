@@ -2,13 +2,30 @@ const config = require('./config');
 const { createPool, migrate } = require('./db');
 const { createApp } = require('./app');
 const { reapExpiredLeases } = require('./queue');
+const { createStripeBilling } = require('./billing');
 
 async function main() {
   const pool = createPool(config.databaseUrl);
   const applied = await migrate(pool);
   if (applied.length) console.log(`Applied migrations: ${applied.join(', ')}`);
 
-  const app = createApp({ pool, leaseSeconds: config.leaseSeconds });
+  const stripeBilling = createStripeBilling({
+    secretKey: config.stripeSecretKey,
+    webhookSecret: config.stripeWebhookSecret,
+    publicUrl: config.publicUrl,
+  });
+  console.log(`Card top-ups: ${stripeBilling ? 'enabled' : 'disabled (set STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET)'}`);
+  console.log(`Admin API: ${config.adminToken ? 'enabled' : 'disabled (set ADMIN_TOKEN)'}`);
+
+  const app = createApp({
+    pool,
+    leaseSeconds: config.leaseSeconds,
+    verifyRate: config.verifyRate,
+    adminToken: config.adminToken,
+    stripeBilling,
+    cookieSecure: config.cookieSecure,
+    trustProxy: config.trustProxy,
+  });
   // Bind all interfaces: LingCode hosted apps must listen on 0.0.0.0:$PORT.
   const server = app.listen(config.port, '0.0.0.0', () => {
     console.log(`computedistribute API listening on port ${config.port}`);

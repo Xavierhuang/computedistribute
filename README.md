@@ -1,10 +1,45 @@
 # computedistribute
 
 A marketplace for spare GPU compute, starting as a **batch-job service**: buyers submit
-jobs through an API, and host machines running the worker agent claim and run them.
-See `reports/Spare compute marketplace research.md` for the market research behind this.
+jobs through an API or the web dashboard, and host machines running the worker agent claim
+and run them. See `reports/Spare compute marketplace research.md` for the market research behind this.
 
-## What's here
+## How the marketplace works
+
+- **Accounts:** people sign up on the dashboard (`/`) as a **buyer** or a **host**, then
+  create API keys there. Sessions use an HttpOnly cookie, and passwords are hashed with scrypt.
+  Accounts can be deleted from the dashboard.
+- **Money** (`src/ledger.js`, `src/pricing.js`) is an append-only ledger in micro-dollars:
+  - Submitting a job places a **hold** for its maximum cost (4 hours of audio).
+  - When the job succeeds, the hold is released and the buyer is **charged** for the
+    actual audio length, billed per second.
+  - The host **earns 70%** of that charge.
+  - Failed, canceled and timed-out jobs release the hold and cost nothing.
+  - Every movement happens in the same transaction as the job's state change, and is
+    idempotent per job.
+- **Prices** (`GET /v1/pricing`), per audio minute:
+
+  | Model | Price |
+  |---|---|
+  | `tiny` | $0.001 |
+  | `base` | $0.0015 |
+  | `small` | $0.002 |
+  | `medium` | $0.003 |
+  | `large-v3` | $0.004 |
+- **Adding credit:** buyers pay by card through Stripe Checkout, which credits the account
+  from a signed webhook (once per session). Admins can also grant credit directly.
+- **Payouts:** a host requests a payout of at least $10, which moves the amount out of
+  their balance. An admin sends the money (PayPal or Wise, by hand for now) and marks the
+  payout paid, or rejects it, which returns the money.
+- **Verification** (`src/verify.js`): `VERIFY_RATE` of successful jobs (5% by default) are
+  re-run on a *different host's* machine, and the two transcripts are compared.
+  - A mismatch refunds the buyer and claws back the original host's earning.
+  - A host is suspended after 3 or more failed checks, if they make up more than 25% of its checks.
+  - The platform pays for re-runs, which costs about 3.5% of revenue at a 5% sample rate.
+- **Admin** (`/v1/admin`, `Authorization: Bearer $ADMIN_TOKEN`) covers stats, accounts,
+  credit grants, suspensions and payouts.
+
+## Components
 
 - **Job API and queue** (`src/`): Express plus Postgres. Workers claim jobs atomically
   (`FOR UPDATE SKIP LOCKED`) and hold a lease, which they extend by heartbeating. A reaper
@@ -88,6 +123,19 @@ All requests need `Authorization: Bearer <api key>`. Buyer and host keys can't b
 | host | `POST /v1/host/leases/:leaseId/heartbeat` | Extend the lease |
 | host | `POST /v1/host/leases/:leaseId/complete` | Report `{output}` |
 | host | `POST /v1/host/leases/:leaseId/fail` | Report `{error, retryable}` |
+| anyone | `GET /v1/pricing` | Price list |
+| anyone | `POST /v1/auth/signup` · `/login` · `/logout` | Dashboard sessions `{email, password, kind}` |
+| any account | `GET /v1/me` · `GET /v1/me/ledger` | Profile and balance; ledger history |
+| any account | `GET/POST /v1/me/api-keys`, `DELETE /v1/me/api-keys/:id` | Manage API keys |
+| any account | `DELETE /v1/me` | Delete the account `{password}` (session only) |
+| buyer | `POST /v1/me/topups` | `{amount_usd: 5–1000}` → Stripe Checkout URL |
+| host | `GET /v1/me/workers` · `GET/POST /v1/me/payouts` | Machines with stats; payout requests `{amount_usd, destination}` |
+| Stripe | `POST /v1/stripe/webhook` | Signed `checkout.session.completed` events credit the buyer |
+| admin | `/v1/admin/stats`, `/accounts`, `/grants`, `/accounts/:id/suspend`, `/unsuspend`, `/payouts`, `/payouts/:id/paid`, `/payouts/:id/reject` | Operations |
+
+The dashboard uses the same endpoints with a session cookie instead of an API key.
+Cookie-authenticated `POST`s must be JSON, which blocks cross-site form posts (CSRF).
+A job submitted without enough credit returns `402 insufficient_funds`.
 
 Lease endpoints return `409 lease_lost` when the job was canceled, reassigned or already finished. The worker should then drop the job.
 
@@ -103,15 +151,26 @@ platform injects.
   On boot the app sees nothing pending and runs no DDL.
 - **RLS** is enabled on every table with no policies, so the public anon key can't read
   `api_keys` or `jobs`. The app's own role still has access. Keep it that way.
-- **Accounts:** `scripts/create-account.js` needs direct database access, which isn't
-  available from outside. On Cloud, insert the account and the SHA-256 hash of a new
-  key through the migration tool. (An admin endpoint would replace this.)
+- **App settings** (set with the Cloud `set_app_secret` tool, then redeploy):
+  - `PUBLIC_URL`: the https app URL.
+  - `TRUST_PROXY=1`.
+  - `ADMIN_TOKEN`.
+  - Optionally `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`.
+- **Turning on card top-ups:**
+  1. In Stripe, add a webhook endpoint at `<PUBLIC_URL>/v1/stripe/webhook` for
+     `checkout.session.completed` and `checkout.session.async_payment_succeeded`.
+  2. Set both Stripe secrets and redeploy.
+- **Accounts** are self-serve through the dashboard. `scripts/create-account.js` is for
+  local development only.
 
 ## Not built yet
 
-Credits and billing, host payouts (Stripe Connect), more job types (embeddings, image
-generation, LLM batch), sandboxed execution, spot-check verification and reputation,
-self-serve signup, and a web dashboard.
+- **Automatic host payouts** through Stripe Connect. Payouts are sent by hand for now.
+- **Password reset and email verification.** Both need outbound email.
+- **File uploads.** Buyers pass a public audio URL instead.
+- **More job types:** embeddings, image generation, LLM batch.
+- **Sandboxing.** Not needed while every job type runs fixed code; it would be needed
+  before accepting buyer-supplied code.
 
 ## License
 

@@ -17,9 +17,10 @@ function runPython(python, args, { signal }) {
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) return resolve(stdout);
-      // Most failures here are environmental (OOM, missing CUDA), so another host may succeed.
       const lastLine = stderr.trim().split('\n').pop() || `exit code ${code}`;
-      reject(new JobError(`whisper failed: ${lastLine}`, { retryable: true }));
+      // Exit 3 = the input itself is unacceptable. Other failures are usually
+      // environmental (OOM, missing CUDA), so another host may succeed.
+      reject(new JobError(`whisper failed: ${lastLine}`, { retryable: code !== 3 }));
     });
   });
 }

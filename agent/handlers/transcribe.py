@@ -17,10 +17,15 @@ def main() -> None:
     parser.add_argument("--language", default=None)
     parser.add_argument("--task", default="transcribe", choices=["transcribe", "translate"])
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--max-duration", type=float, default=4 * 3600)
     args = parser.parse_args()
 
     model = WhisperModel(args.model, device=args.device, compute_type="auto")
     segments, info = model.transcribe(args.audio_path, language=args.language, task=args.task)
+    if info.duration > args.max_duration:
+        # Exit code 3 tells the agent this is permanent: the audio is too long everywhere.
+        print(f"audio is {info.duration:.0f}s; the limit is {args.max_duration:.0f}s", file=sys.stderr)
+        sys.exit(3)
     # segments is a lazy generator: transcription actually happens while iterating.
     out_segments = [
         {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
