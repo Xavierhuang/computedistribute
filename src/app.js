@@ -53,7 +53,7 @@ function createApp(options) {
           count(j.id) FILTER (WHERE j.status = 'running')::int AS running,
           count(j.id) FILTER (WHERE j.status = 'succeeded' AND j.finished_at > now() - interval '1 hour')::int AS done_last_hour
         FROM workers w LEFT JOIN jobs j ON j.worker_id = w.id
-        WHERE w.last_seen_at > now() - interval '2 minutes'
+        WHERE w.last_seen_at > now() - interval '45 seconds'
         GROUP BY w.id ORDER BY w.name`),
       pool.query(`SELECT
           count(*) FILTER (WHERE status = 'queued')::int AS queued,
