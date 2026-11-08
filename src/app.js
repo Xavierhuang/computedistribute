@@ -1,6 +1,6 @@
 const express = require('express');
 const { requireAccount } = require('./auth');
-const { validateJobInput, jobTypes } = require('./jobTypes');
+const { validateJobInput, defaultMinVramGb, jobTypes } = require('./jobTypes');
 const queue = require('./queue');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -34,7 +34,9 @@ function uuidParam(req, res, next, id) {
 
 function createApp({ pool, leaseSeconds }) {
   const app = express();
-  app.use(express.json({ limit: '256kb' }));
+  // Job inputs are capped at 64 KB separately; this limit is sized for worker
+  // results such as long transcripts. Anything bigger should go to file storage.
+  app.use(express.json({ limit: '5mb' }));
 
   app.get('/', (req, res) => res.json({ service: 'computedistribute', job_types: Object.keys(jobTypes) }));
   app.get('/health', wrap(async (req, res) => {
@@ -57,7 +59,7 @@ function createApp({ pool, leaseSeconds }) {
     const { job, created } = await queue.enqueue(pool, req.account.id, {
       type: body.type,
       input: body.input,
-      minVramGb: numInRange(body.min_vram_gb, 'min_vram_gb', 0, 1024, 0),
+      minVramGb: numInRange(body.min_vram_gb, 'min_vram_gb', 0, 1024, defaultMinVramGb(body.type, body.input)),
       priority: intInRange(body.priority, 'priority', -100, 100, 0),
       maxAttempts: intInRange(body.max_attempts, 'max_attempts', 1, 10, 3),
       idempotencyKey,
@@ -95,8 +97,7 @@ function createApp({ pool, leaseSeconds }) {
   host.use(requireAccount(pool, 'host'));
   host.param('id', uuidParam);
 
-  host.post('/workers', wrap(async (req, res) => {
-    const body = req.body || {};
+  function parseWorkerBody(body = {}) {
     if (typeof body.name !== 'string' || !body.name.trim() || body.name.length > 100) {
       throw new BadRequest('name is required (max 100 characters)');
     }
@@ -108,13 +109,25 @@ function createApp({ pool, leaseSeconds }) {
     if (typeof capabilities !== 'object' || Array.isArray(capabilities) || capabilities === null) {
       throw new BadRequest('capabilities must be a JSON object');
     }
-    const worker = await queue.registerWorker(pool, req.account.id, {
+    return {
       name: body.name.trim(),
       jobTypes: [...new Set(types)],
       vramGb: numInRange(body.vram_gb, 'vram_gb', 0, 1024, 0),
       capabilities,
-    });
-    res.status(201).json({ id: worker.id, name: worker.name, job_types: worker.job_types, vram_gb: Number(worker.vram_gb) });
+    };
+  }
+  const publicWorker = (w) => ({ id: w.id, name: w.name, job_types: w.job_types, vram_gb: Number(w.vram_gb) });
+
+  host.post('/workers', wrap(async (req, res) => {
+    const worker = await queue.registerWorker(pool, req.account.id, parseWorkerBody(req.body));
+    res.status(201).json(publicWorker(worker));
+  }));
+
+  // Replaces a worker's declared job types, VRAM and capabilities (agents call this on start).
+  host.put('/workers/:id', wrap(async (req, res) => {
+    const worker = await queue.updateWorker(pool, req.account.id, req.params.id, parseWorkerBody(req.body));
+    if (!worker) return res.status(404).json({ error: 'worker_not_found' });
+    res.json(publicWorker(worker));
   }));
 
   host.post('/workers/:id/claim', wrap(async (req, res) => {

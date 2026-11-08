@@ -211,3 +211,43 @@ test('validation rejects bad input with 400 and bad ids with 404', async () => {
   });
   assert.equal(badJson.status, 400);
 });
+
+test('transcribe: validates input and defaults min_vram_gb from the model', async () => {
+  const { buyer } = await setup();
+  const t = (input) => call(buyer, 'POST', '/v1/jobs', { type: 'transcribe', input });
+  for (const [input, why] of [
+    [{}, 'missing url'],
+    [{ audio_url: 'ftp://example.com/a.mp3' }, 'non-http scheme'],
+    [{ audio_url: 'http://localhost/a.mp3' }, 'localhost'],
+    [{ audio_url: 'http://192.168.1.1/a.mp3' }, 'IP literal'],
+    [{ audio_url: 'http://[::1]/a.mp3' }, 'IPv6 literal'],
+    [{ audio_url: 'https://user:pw@example.com/a.mp3' }, 'credentials'],
+    [{ audio_url: 'https://example.com/a.mp3', model: 'huge' }, 'bad model'],
+    [{ audio_url: 'https://example.com/a.mp3', language: 'English' }, 'bad language'],
+    [{ audio_url: 'https://example.com/a.mp3', task: 'summarize' }, 'bad task'],
+    [{ audio_url: 'https://example.com/a.mp3', prompt: 'x' }, 'unknown field'],
+  ]) {
+    assert.equal((await t(input)).status, 400, why);
+  }
+
+  const small = await t({ audio_url: 'https://example.com/a.mp3' });
+  assert.equal(small.status, 201);
+  assert.equal(small.body.min_vram_gb, 2, 'default model is small');
+  assert.equal((await t({ audio_url: 'https://example.com/a.mp3', model: 'large-v3', language: 'en', task: 'translate' })).body.min_vram_gb, 10);
+  const explicit = await call(buyer, 'POST', '/v1/jobs', { type: 'transcribe', input: { audio_url: 'https://example.com/a.mp3' }, min_vram_gb: 0 });
+  assert.equal(explicit.body.min_vram_gb, 0, 'explicit min_vram_gb wins, even 0');
+});
+
+test('PUT /workers/:id updates job types so a reused worker can take new work', async () => {
+  const { buyer, host, workerId } = await setup({ vramGb: 0 });
+  const job = await call(buyer, 'POST', '/v1/jobs', { type: 'transcribe', input: { audio_url: 'https://example.com/a.mp3' } });
+  assert.equal((await claim(host, workerId)).status, 204, 'echo-only worker without VRAM gets nothing');
+
+  const updated = await call(host, 'PUT', `/v1/host/workers/${workerId}`, { name: 'rig-1', job_types: ['echo', 'transcribe'], vram_gb: 8 });
+  assert.equal(updated.status, 200);
+  assert.deepEqual(updated.body.job_types, ['echo', 'transcribe']);
+  assert.equal((await claim(host, workerId)).body.job.id, job.body.id);
+
+  const otherHost = (await createAccount(pool, { name: 'h2', kind: 'host' })).apiKey;
+  assert.equal((await call(otherHost, 'PUT', `/v1/host/workers/${workerId}`, { name: 'x', job_types: ['echo'] })).status, 404);
+});

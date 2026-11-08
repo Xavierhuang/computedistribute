@@ -1,0 +1,6 @@
+# Python dependencies for the worker agent's "transcribe" handler.
+# Install into a virtualenv OUTSIDE this repo and point CD_PYTHON at its python.
+faster-whisper==1.2.1
+# faster-whisper calls av.open(metadata_errors=...), which newer PyAV removed.
+# 14.4 had no prebuilt wheel for macOS arm64 (Nov 2026) and needs an ffmpeg 7 source build.
+av>=11,<14.3

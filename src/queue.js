@@ -76,6 +76,15 @@ async function registerWorker(pool, hostId, { name, jobTypes, vramGb = 0, capabi
   return rows[0];
 }
 
+async function updateWorker(pool, hostId, workerId, { name, jobTypes, vramGb = 0, capabilities = {} }) {
+  const { rows } = await pool.query(
+    `UPDATE workers SET name = $3, job_types = $4, vram_gb = $5, capabilities = $6, last_seen_at = now()
+     WHERE id = $1 AND account_id = $2 RETURNING *`,
+    [workerId, hostId, name, jobTypes, vramGb, JSON.stringify(capabilities)],
+  );
+  return rows[0] || null;
+}
+
 // Atomically hands the highest-priority matching job to this worker, or returns null.
 // SKIP LOCKED lets many workers claim concurrently without ever taking the same job.
 async function claim(pool, hostId, workerId, leaseSeconds) {
@@ -165,6 +174,7 @@ module.exports = {
   listBuyerJobs,
   cancel,
   registerWorker,
+  updateWorker,
   claim,
   heartbeat,
   complete,

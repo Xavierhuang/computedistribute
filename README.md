@@ -11,11 +11,20 @@ See `reports/Spare compute marketplace research.md` for the market research behi
   requeues jobs whose worker went quiet, and fails them once `max_attempts` is used up.
   Every claim issues a new `lease_id`, so a slow or stale worker can't overwrite a job
   that has since been reassigned or canceled.
-- **Worker agent** (`agent/agent.js`): registers a machine, polls for work, heartbeats
-  and reports results. It runs handlers in-process, which is **not** isolation: jobs must
-  run in a VM or sandbox before untrusted hosts or buyer-supplied code are allowed.
-- **Job types** (`src/jobTypes.js`): only `echo` for now. Real workloads (transcription,
-  embeddings, image generation, LLM batch) get added here and in the agent's `handlers`.
+- **Worker agent** (`agent/agent.js`): registers a machine (or syncs a reused one's job
+  types on start), polls for work, heartbeats, and reports results. Handlers run on the
+  host without a sandbox. That's acceptable for the fixed job types below, but buyer-supplied
+  code would need a VM or sandbox first.
+- **Job types** (`src/jobTypes.js` validates them; `agent/handlers/` runs them):
+  - `echo`: returns its input. Useful for testing the loop.
+  - `transcribe`: Whisper speech-to-text via `faster-whisper` (CUDA if available, else CPU).
+    Input `{audio_url, model?, language?, task?}`. Models are `tiny`, `base`, `small` (the default),
+    `medium` and `large-v3`, and the model sets the default `min_vram_gb` (1–10 GB).
+    `task: "translate"` outputs English. Output `{text, language, language_probability, duration_s, model, segments[]}`.
+- **Buyer URLs are fetched safely** (`agent/net.js`): the agent refuses private, loopback
+  and link-local addresses *after* DNS resolution and on every redirect, so a buyer
+  can't make a host probe its own network. Downloads are capped (`CD_MAX_DOWNLOAD_MB`,
+  default 500). 4xx and blocked URLs fail immediately; transient errors are retried.
 
 ## Run locally
 
@@ -41,11 +50,26 @@ npm run create-account -- host "My rig"          # prints a host API key once
 CD_HOST_KEY=<host key> CD_VRAM_GB=24 npm run agent
 ```
 
-Submit a job:
+To let the agent run `transcribe` jobs, give it a Python with `faster-whisper`. Keep the
+virtualenv outside the repo:
+
+```sh
+VENV="$HOME/.local/share/computedistribute/venv"
+uv venv --python 3.12 "$VENV" && uv pip install --python "$VENV/bin/python" -r agent/requirements.txt
+CD_PYTHON="$VENV/bin/python" CD_HOST_KEY=<host key> CD_VRAM_GB=16 npm run agent
+```
+
+The first job for each model downloads its weights from Hugging Face (75 MB for `tiny`, about 3 GB for `large-v3`).
+
+Submit jobs:
 
 ```sh
 curl -X POST localhost:3000/v1/jobs -H "authorization: Bearer <buyer key>" \
   -H 'content-type: application/json' -d '{"type":"echo","input":{"hello":"world"}}'
+
+curl -X POST localhost:3000/v1/jobs -H "authorization: Bearer <buyer key>" \
+  -H 'content-type: application/json' \
+  -d '{"type":"transcribe","input":{"audio_url":"https://github.com/openai/whisper/raw/main/tests/jfk.flac","model":"tiny"}}'
 ```
 
 ## API
@@ -59,6 +83,7 @@ All requests need `Authorization: Bearer <api key>`. Buyer and host keys can't b
 | buyer | `GET /v1/jobs/:id` | Job status, output, error |
 | buyer | `POST /v1/jobs/:id/cancel` | Cancel a queued or running job |
 | host | `POST /v1/host/workers` | Register a machine `{name, job_types, vram_gb, capabilities?}` |
+| host | `PUT /v1/host/workers/:id` | Replace a worker's name, job types, VRAM and capabilities |
 | host | `POST /v1/host/workers/:id/claim` | Get the next matching job and a lease (`204` if none) |
 | host | `POST /v1/host/leases/:leaseId/heartbeat` | Extend the lease |
 | host | `POST /v1/host/leases/:leaseId/complete` | Report `{output}` |
@@ -84,8 +109,9 @@ platform injects.
 
 ## Not built yet
 
-Credits and billing, host payouts (Stripe Connect), real job types, sandboxed execution,
-spot-check verification and reputation, and a web dashboard.
+Credits and billing, host payouts (Stripe Connect), more job types (embeddings, image
+generation, LLM batch), sandboxed execution, spot-check verification and reputation,
+self-serve signup, and a web dashboard.
 
 ## License
 

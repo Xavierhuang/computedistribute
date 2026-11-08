@@ -1,12 +1,16 @@
 // Reference worker agent: registers with the marketplace, claims jobs, heartbeats
 // while running them, and reports results.
 //
-// Handlers run IN-PROCESS. That is fine for the trusted job types defined here, but
-// it is NOT isolation: before running buyer-supplied code on third-party hosts, each
-// job must run inside a VM or sandbox (see the research report's security section).
+// Handlers run on the host without a sandbox. That is acceptable for the fixed job
+// types here (no buyer code runs; buyer URLs are fetched through a private-address
+// guard), but buyer-supplied code would need a VM or sandbox first.
 //
 // Env: CD_API_URL (default http://localhost:3000), CD_HOST_KEY (required),
-//      CD_WORKER_ID (reuse a registered worker), CD_WORKER_NAME, CD_VRAM_GB, CD_POLL_MS.
+//      CD_WORKER_ID (reuse a registered worker), CD_WORKER_NAME, CD_VRAM_GB, CD_POLL_MS,
+//      CD_PYTHON (Python with faster-whisper; enables "transcribe"),
+//      CD_MAX_DOWNLOAD_MB (default 500), CD_ALLOW_PRIVATE_URLS=1 (local testing only).
+
+const { createTranscribeHandler, isAvailable } = require('./handlers/transcribe');
 
 const API = (process.env.CD_API_URL || 'http://localhost:3000').replace(/\/$/, '');
 const KEY = process.env.CD_HOST_KEY;
@@ -15,6 +19,26 @@ const POLL_MS = Number(process.env.CD_POLL_MS || 2000);
 const handlers = {
   echo: async (input) => input,
 };
+
+async function loadOptionalHandlers() {
+  const python = process.env.CD_PYTHON;
+  if (!python) {
+    console.log('transcribe: disabled (set CD_PYTHON to a Python with faster-whisper installed)');
+    return;
+  }
+  if (!(await isAvailable(python))) {
+    console.log(`transcribe: disabled (${python} cannot import faster_whisper)`);
+    return;
+  }
+  const allowPrivateUrls = process.env.CD_ALLOW_PRIVATE_URLS === '1';
+  if (allowPrivateUrls) console.warn('WARNING: CD_ALLOW_PRIVATE_URLS=1 lets jobs fetch private network addresses. Local testing only.');
+  handlers.transcribe = createTranscribeHandler({
+    python,
+    maxBytes: Number(process.env.CD_MAX_DOWNLOAD_MB || 500) * 1024 * 1024,
+    allowPrivateUrls,
+  });
+  console.log('transcribe: enabled');
+}
 
 class LeaseLost extends Error {}
 
@@ -45,7 +69,9 @@ async function runJob(claimed) {
 
   try {
     console.log(`→ job ${job.id} (${job.type}, attempt ${job.attempt})`);
-    const output = await handlers[job.type](job.input, { signal: controller.signal });
+    const handler = handlers[job.type];
+    if (!handler) throw Object.assign(new Error(`this agent cannot run "${job.type}" jobs`), { retryable: true });
+    const output = await handler(job.input, { signal: controller.signal });
     if (controller.signal.aborted) throw new LeaseLost();
     await api('POST', `/leases/${leaseId}/complete`, { output });
     console.log(`✓ job ${job.id} succeeded`);
@@ -55,7 +81,9 @@ async function runJob(claimed) {
       return;
     }
     console.error(`✗ job ${job.id} failed: ${err.message}`);
-    await api('POST', `/leases/${leaseId}/fail`, { error: err.message, retryable: true }).catch(() => {});
+    // Errors are retried on another attempt unless the handler marked them permanent
+    // (e.g. a 404 audio URL), which would fail the same way everywhere.
+    await api('POST', `/leases/${leaseId}/fail`, { error: err.message, retryable: err.retryable !== false }).catch(() => {});
   } finally {
     clearInterval(beat);
   }
@@ -66,15 +94,20 @@ async function main() {
     console.error('Set CD_HOST_KEY to a host API key (npm run create-account -- host "<name>")');
     process.exit(2);
   }
+  await loadOptionalHandlers();
+  const registration = {
+    name: process.env.CD_WORKER_NAME || require('node:os').hostname(),
+    job_types: Object.keys(handlers),
+    vram_gb: Number(process.env.CD_VRAM_GB || 0),
+  };
   let workerId = process.env.CD_WORKER_ID;
-  if (!workerId) {
-    const worker = await api('POST', '/workers', {
-      name: process.env.CD_WORKER_NAME || require('node:os').hostname(),
-      job_types: Object.keys(handlers),
-      vram_gb: Number(process.env.CD_VRAM_GB || 0),
-    });
-    workerId = worker.id;
-    console.log(`Registered worker ${workerId}. Set CD_WORKER_ID=${workerId} to reuse it next time.`);
+  if (workerId) {
+    // Sync what this machine can do now, so a reused worker gets newly enabled job types.
+    await api('PUT', `/workers/${workerId}`, registration);
+    console.log(`Worker ${workerId} ready for: ${registration.job_types.join(', ')}`);
+  } else {
+    workerId = (await api('POST', '/workers', registration)).id;
+    console.log(`Registered worker ${workerId} for: ${registration.job_types.join(', ')}. Set CD_WORKER_ID=${workerId} to reuse it.`);
   }
 
   let stopping = false;
