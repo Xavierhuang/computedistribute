@@ -1,8 +1,46 @@
 # computedistribute
 
-A marketplace for spare GPU compute, starting as a **batch-job service**: buyers submit
-jobs through an API or the web dashboard, and host machines running the worker agent claim
-and run them. See `reports/Spare compute marketplace research.md` for the market research behind this.
+**A marketplace for spare GPU compute.** Buyers submit speech-to-text jobs. Anyone with an
+idle GPU runs our worker agent and earns 70% of every job their machine completes.
+Built for the hackathon's **distributed compute track**.
+
+- **Live:** https://computedistribute-7e117eb4.apps.lingcode.app
+- **Demo video:** a 2-minute narrated walkthrough, recorded from the real system. It is not
+  in git; generate it with `node scripts/record-demo.js` (see [Demo video](#demo-video)).
+- **Market research:** `reports/Spare compute marketplace research.md`.
+
+## Try it in 2 minutes
+
+1. Open the live site and create a **buyer** account. Demo mode gives you $5 of free credit.
+2. Check the **Live network** card. Jobs only run while at least one machine is online
+   (see [Run a worker](#run-locally) to add your own).
+3. Paste a public audio URL, choose **3 machines in parallel**, and click **Transcribe**.
+   This one is 4 min 16 s of clear speech:
+   `https://upload.wikimedia.org/wikipedia/commons/0/01/President_Ronald_Reagan%27s_Address_to_the_Nation_on_the_Explosion_of_The_Space_Shuttle_Challenger_from_the_Oval_Office_-_DPLA_-_0f2ec85660d45e2ed94bb8dc3579d2e4.mp3`
+4. Open **Chunks by machine** to watch each chunk run on a different machine, then
+   **Merged transcript** to see the result stitched back together.
+5. Kill one worker mid-job (Ctrl-C twice in its terminal). About 15 s later its chunk moves
+   to another machine and the job still completes, at no extra cost to the buyer.
+
+## The distributed-compute ideas
+
+| Problem | How it's solved | Where |
+|---|---|---|
+| Many machines asking for work at once | Each job is claimed atomically with `SELECT … FOR UPDATE SKIP LOCKED`; it is never handed to two machines at once. Tested with 25 concurrent claims for 10 jobs. | `src/queue.js` `claim` |
+| Splitting one big job | The dashboard reads the audio's length and submits one chunk job per time range (`clip_start_s`/`clip_end_s` plus a shared `group`). The scheduler fans chunks out to different machines, and the dashboard merges them in time order. | `public/app.js`, `src/jobTypes.js` |
+| Machines crashing or going silent | A claim is a **lease** (15 s in the demo) that the worker renews by heartbeating. A reaper requeues expired leases, so another machine retries the job, up to `max_attempts`. Every claim gets a new `lease_id`, so a slow or stale worker can't overwrite the newer result. | `src/queue.js`, `agent/agent.js` |
+| Untrusted machines lying about results | 5% of jobs are re-run on a **different owner's** machine and compared. A mismatch refunds the buyer and claws back the host's pay; repeat offenders are suspended. | `src/verify.js` |
+| Untrusted buyers attacking hosts | Workers fetch buyer URLs through a guard that refuses private and internal addresses after DNS resolution and on every redirect. | `agent/net.js` |
+| Paying many parties correctly | Every money movement is written in the same database transaction as the job's state change, in an append-only ledger. Each job is charged and released exactly once. | `src/ledger.js` |
+
+**Honest limits:**
+- **Speedup needs separate computers.** One Whisper process already uses every CPU core,
+  so three workers on one laptop are no faster than one. Measured on an M4: 47.0 s
+  whole versus 47.7 s split three ways. The speedup across separate machines hasn't been
+  measured yet.
+- **Chunk boundaries can cut a word,** because chunks are split at fixed times rather
+  than at pauses in speech.
+- **Each worker downloads the whole file,** not just its chunk.
 
 ## How the marketplace works
 
@@ -53,9 +91,11 @@ and run them. See `reports/Spare compute marketplace research.md` for the market
 - **Job types** (`src/jobTypes.js` validates them; `agent/handlers/` runs them):
   - `echo`: returns its input. Useful for testing the loop.
   - `transcribe`: Whisper speech-to-text via `faster-whisper` (CUDA if available, else CPU).
-    Input `{audio_url, model?, language?, task?}`. Models are `tiny`, `base`, `small` (the default),
+    Input `{audio_url, model?, language?, task?, clip_start_s?, clip_end_s?, group?}`. Models are `tiny`, `base`, `small` (the default),
     `medium` and `large-v3`, and the model sets the default `min_vram_gb` (1–10 GB).
     `task: "translate"` outputs English. Output `{text, language, language_probability, duration_s, model, segments[]}`.
+    With a clip range, only that part of the file is transcribed and billed, and the funds held cover just the clip.
+    Chunk jobs that share a `group` are shown and merged together on the dashboard.
 - **Buyer URLs are fetched safely** (`agent/net.js`): the agent refuses private, loopback
   and link-local addresses *after* DNS resolution and on every redirect, so a buyer
   can't make a host probe its own network. Downloads are capped (`CD_MAX_DOWNLOAD_MB`,
@@ -124,6 +164,8 @@ All requests need `Authorization: Bearer <api key>`. Buyer and host keys can't b
 | host | `POST /v1/host/leases/:leaseId/complete` | Report `{output}` |
 | host | `POST /v1/host/leases/:leaseId/fail` | Report `{error, retryable}` |
 | anyone | `GET /v1/pricing` | Price list |
+| anyone | `GET /v1/network` | Live view: machines seen in the last 45 s, plus jobs queued, running and recently done |
+| buyer | `POST /v1/me/demo-credit` | Demo mode only: add `DEMO_CREDIT_USD` of free credit (up to 4× that balance) |
 | anyone | `POST /v1/auth/signup` · `/login` · `/logout` | Dashboard sessions `{email, password, kind}` |
 | any account | `GET /v1/me` · `GET /v1/me/ledger` | Profile and balance; ledger history |
 | any account | `GET/POST /v1/me/api-keys`, `DELETE /v1/me/api-keys/:id` | Manage API keys |
@@ -151,17 +193,38 @@ platform injects.
   On boot the app sees nothing pending and runs no DDL.
 - **RLS** is enabled on every table with no policies, so the public anon key can't read
   `api_keys` or `jobs`. The app's own role still has access. Keep it that way.
-- **App settings** (set with the Cloud `set_app_secret` tool, then redeploy):
+- **App settings:** hosted apps receive the backend's vault secrets as environment
+  variables. Set them with the Cloud `set_backend_secret` tool (not `set_app_secret`,
+  which is for Worker apps), then redeploy. Current production values:
   - `PUBLIC_URL`: the https app URL.
   - `TRUST_PROXY=1`.
   - `ADMIN_TOKEN`.
-  - Optionally `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`.
+  - Hackathon demo settings: `DEMO_CREDIT_USD=5`, `LEASE_SECONDS=15` and
+    `REAPER_INTERVAL_MS=3000`, so failover shows up within seconds.
+  - Stripe is **not** connected for the hackathon. Setting `STRIPE_SECRET_KEY` and
+    `STRIPE_WEBHOOK_SECRET` would enable card top-ups.
 - **Turning on card top-ups:**
   1. In Stripe, add a webhook endpoint at `<PUBLIC_URL>/v1/stripe/webhook` for
      `checkout.session.completed` and `checkout.session.async_payment_succeeded`.
   2. Set both Stripe secrets and redeploy.
 - **Accounts** are self-serve through the dashboard. `scripts/create-account.js` is for
   local development only.
+
+## Demo video
+
+`node scripts/record-demo.js` writes `demo-video/computedistribute-demo.mp4`, a narrated
+2-minute walkthrough. It does this by:
+1. starting a local server and three worker agents;
+2. driving the real dashboard in headless Chromium through a 3-way split and a mid-job crash;
+3. narrating each caption with macOS text-to-speech (`DEMO_VOICE`, default "Ava (Premium)");
+4. mixing the narration in with ffmpeg.
+
+It needs:
+- the local Postgres on :54329;
+- the Whisper venv;
+- Playwright and Chromium in `~/.local/share/computedistribute/videotools`:
+  `npm install playwright-core && npx playwright-core install chromium`;
+- `imageio-ffmpeg` installed in the venv.
 
 ## Not built yet
 
