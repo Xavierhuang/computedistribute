@@ -11,7 +11,7 @@ const { BadRequest, wrap } = require('./http');
 
 // options: pool, leaseSeconds, verifyRate (0–1), adminToken, stripeBilling, cookieSecure, trustProxy
 function createApp(options) {
-  const { pool, leaseSeconds = 60, verifyRate = 0, adminToken = null, stripeBilling = null, cookieSecure = false, trustProxy = false } = options;
+  const { pool, leaseSeconds = 60, verifyRate = 0, adminToken = null, stripeBilling = null, demoCreditUsd = 0, cookieSecure = false, trustProxy = false } = options;
   const app = express();
   app.disable('x-powered-by');
   if (trustProxy) app.set('trust proxy', 1); // so req.ip is the client, not the platform proxy
@@ -19,7 +19,7 @@ function createApp(options) {
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'same-origin');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    res.setHeader('Content-Security-Policy', "default-src 'self'; media-src https:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     next();
   });
 
@@ -46,10 +46,29 @@ function createApp(options) {
   app.get('/v1', (req, res) => res.json({ service: 'computedistribute', job_types: Object.keys(jobTypes) }));
   app.get('/v1/pricing', (req, res) => res.json(publicPriceList()));
 
+  // Public live view of the network for the dashboard: machines and job flow.
+  app.get('/v1/network', wrap(async (req, res) => {
+    const [workers, totals] = await Promise.all([
+      pool.query(`SELECT w.name, w.job_types, w.vram_gb, w.last_seen_at,
+          count(j.id) FILTER (WHERE j.status = 'running')::int AS running,
+          count(j.id) FILTER (WHERE j.status = 'succeeded' AND j.finished_at > now() - interval '1 hour')::int AS done_last_hour
+        FROM workers w LEFT JOIN jobs j ON j.worker_id = w.id
+        WHERE w.last_seen_at > now() - interval '2 minutes'
+        GROUP BY w.id ORDER BY w.name`),
+      pool.query(`SELECT
+          count(*) FILTER (WHERE status = 'queued')::int AS queued,
+          count(*) FILTER (WHERE status = 'running')::int AS running,
+          count(*) FILTER (WHERE status = 'succeeded' AND finished_at > now() - interval '10 minutes')::int AS done_last_10_min,
+          coalesce(sum((output->>'duration_s')::numeric) FILTER (WHERE status = 'succeeded' AND type = 'transcribe' AND finished_at > now() - interval '10 minutes'), 0)::float AS audio_seconds_last_10_min
+        FROM jobs`),
+    ]);
+    res.json({ workers_online: workers.rows.map((w) => ({ ...w, vram_gb: Number(w.vram_gb) })), ...totals.rows[0] });
+  }));
+
   app.use('/v1/jobs', jobsRouter({ pool }));
   app.use('/v1/host', hostRouter({ pool, leaseSeconds, verifyRate }));
   app.use('/v1/admin', adminRouter({ pool, adminToken }));
-  app.use('/v1', accountRouter({ pool, cookieSecure, stripeBilling }));
+  app.use('/v1', accountRouter({ pool, cookieSecure, stripeBilling, demoCreditUsd }));
 
   app.use('/v1', (req, res) => res.status(404).json({ error: 'not_found' }));
   app.use(express.static(path.join(__dirname, '..', 'public'), { index: 'index.html', maxAge: '5m' }));

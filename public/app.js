@@ -60,6 +60,37 @@ function field(label, input) {
   return [h('label', { for: input.id }, label), input];
 }
 
+// ---------- live network ----------
+
+let netTimer = null;
+
+// Machines online and job flow, refreshed every 3 s. One timer for the whole page.
+function networkCard() {
+  clearInterval(netTimer);
+  const body = h('div', {}, h('p', { class: 'muted small' }, 'Loading…'));
+  const card = h('div', { class: 'card' }, h('h2', {}, 'Live network'), body);
+  async function refresh() {
+    if (!card.isConnected && netTimer) return clearInterval(netTimer);
+    try {
+      const n = await api('GET', '/v1/network');
+      body.replaceChildren(
+        h('div', { class: 'row' },
+          h('span', { class: 'big' }, String(n.workers_online.length)), h('span', { class: 'muted' }, 'machines online ·'),
+          h('strong', {}, String(n.running)), h('span', { class: 'muted' }, 'running ·'),
+          h('strong', {}, String(n.queued)), h('span', { class: 'muted' }, 'queued ·'),
+          h('strong', {}, String(n.done_last_10_min)), h('span', { class: 'muted' }, `done in 10 min (${Math.round(n.audio_seconds_last_10_min / 60)} min of audio)`)),
+        n.workers_online.length
+          ? h('table', {}, h('tr', {}, h('th', {}, 'Machine'), h('th', {}, 'Now'), h('th', { class: 'num' }, 'VRAM'), h('th', { class: 'num' }, 'Jobs (1 h)')),
+            ...n.workers_online.map((w) => h('tr', {}, h('td', {}, w.name), h('td', {}, pill(w.running ? 'running' : 'online')),
+              h('td', { class: 'num' }, `${w.vram_gb} GB`), h('td', { class: 'num' }, w.done_last_hour))))
+          : h('p', { class: 'muted small' }, 'No machines online right now.'));
+    } catch { /* keep the last view */ }
+  }
+  refresh();
+  netTimer = setInterval(refresh, 3000);
+  return card;
+}
+
 // ---------- signed out ----------
 
 function renderAuth(mode = 'signup') {
@@ -89,7 +120,8 @@ function renderAuth(mode = 'signup') {
     h('section', { class: 'hero' },
       h('h1', {}, 'Speech-to-text on spare GPUs'),
       h('p', { class: 'muted' }, 'Whisper transcription from $0.001 per audio minute, billed per second. Have an idle GPU? Run our agent and earn 70% of every job it completes.')),
-    h('div', { class: 'card auth' }, tabs, f));
+    h('div', { class: 'card auth' }, tabs, f),
+    networkCard());
 }
 
 // ---------- shared panels ----------
@@ -105,6 +137,12 @@ function balanceCard(me) {
           e.target.disabled = true;
           try { location.href = (await api('POST', '/v1/me/topups', { amount_usd: amt })).checkout_url; } catch (err) { toast(err.message); e.target.disabled = false; }
         } }, `Add ${money(amt, 0)}`))));
+    } else if (me.demo_credit_usd > 0) {
+      card.append(h('p', { class: 'muted small' }, 'Demo mode: credit is free.'),
+        h('div', { class: 'row' }, h('button', { onclick: async (e) => {
+          e.target.disabled = true;
+          try { await api('POST', '/v1/me/demo-credit', {}); toast('Demo credit added.'); render(); } catch (err) { toast(err.message); e.target.disabled = false; }
+        } }, `Add ${money(me.demo_credit_usd, 0)} demo credit`)));
     } else {
       card.append(h('p', { class: 'muted small' }, 'Card top-ups are not enabled yet. Contact us to add credit.'));
     }
@@ -170,38 +208,119 @@ async function buyerView(me) {
     h('option', { value: m, selected: m === 'small' }, `${m}: $${r}/min`)));
   const lang = h('input', { id: 'lang', name: 'language', placeholder: 'auto-detect (or e.g. en, es, ja)', maxlength: '3' });
   const translate = h('input', { id: 'translate', name: 'translate', type: 'checkbox' });
+  const split = h('select', { id: 'split', name: 'split' }, ...[1, 2, 3, 4, 6, 8].map((n) =>
+    h('option', { value: String(n) }, n === 1 ? '1 machine (whole file)' : `${n} machines in parallel`)));
 
   const submitCard = h('div', { class: 'card' }, h('h2', {}, 'New transcription'),
     form(async (data, el) => {
-      const input = { audio_url: data.get('audio_url'), model: data.get('model') };
-      if (data.get('language')) input.language = String(data.get('language')).toLowerCase();
-      if (data.get('translate')) input.task = 'translate';
-      await api('POST', '/v1/jobs', { type: 'transcribe', input });
-      el.reset(); toast('Job submitted.'); render();
+      const base = { audio_url: data.get('audio_url'), model: data.get('model') };
+      if (data.get('language')) base.language = String(data.get('language')).toLowerCase();
+      if (data.get('translate')) base.task = 'translate';
+      const n = Number(data.get('split'));
+      if (n === 1) {
+        await api('POST', '/v1/jobs', { type: 'transcribe', input: base });
+      } else {
+        // Map step: cut the recording into n time ranges; each becomes its own job,
+        // so the scheduler hands them to different machines at the same time.
+        const duration = await audioDuration(base.audio_url);
+        const group = `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        const step = duration / n;
+        await Promise.all(Array.from({ length: n }, (_, i) => api('POST', '/v1/jobs', { type: 'transcribe', input: {
+          ...base, group,
+          clip_start_s: Math.round(i * step * 100) / 100,
+          clip_end_s: i === n - 1 ? Math.round(duration * 100) / 100 : Math.round((i + 1) * step * 100) / 100,
+        } })));
+      }
+      el.reset(); toast(n === 1 ? 'Job submitted.' : `Split into ${n} chunks.`); render();
     },
     ...field('Audio URL (public link to an audio or video file)', url),
     ...field('Model', model),
+    ...field('Split across', split),
     ...field('Language', lang),
     h('label', { class: 'check' }, translate, 'Translate to English'),
     h('p', { class: 'muted small' }, 'We hold the cost of 4 hours of audio while the job runs, then charge only for the actual length.'),
     h('div', { class: 'row' }, h('button', { class: 'primary', type: 'submit' }, 'Transcribe'))));
 
-  const { jobs } = await api('GET', '/v1/jobs?limit=50');
+  const { jobs } = await api('GET', '/v1/jobs?limit=100');
   const jobsCard = h('div', { class: 'card' }, h('h2', {}, 'Your jobs'),
     jobs.length ? h('table', {}, h('tr', {}, h('th', {}, 'Submitted'), h('th', {}, 'Type'), h('th', {}, 'Status'), h('th', { class: 'num' }, 'Cost'), h('th', {}, 'Result')),
-      ...jobs.map((j) => h('tr', {},
-        h('td', {}, when(j.created_at)),
-        h('td', {}, j.type, j.input?.model ? h('div', { class: 'muted small' }, j.input.model) : null),
-        h('td', {}, pill(j.status), j.attempts > 1 ? h('div', { class: 'muted small' }, `attempt ${j.attempts}`) : null),
-        h('td', { class: 'num' }, fineMoney(j.cost_usd)),
-        h('td', {}, jobResult(j)))))
+      ...groupJobs(jobs).map((item) => (item.group ? groupRow(item) : h('tr', {},
+        h('td', {}, when(item.created_at)),
+        h('td', {}, item.type, item.input?.model ? h('div', { class: 'muted small' }, item.input.model) : null),
+        h('td', {}, pill(item.status), item.worker_name ? h('div', { class: 'muted small' }, `on ${item.worker_name}`) : null,
+          item.attempts > 1 ? h('div', { class: 'muted small' }, `attempt ${item.attempts}`) : null),
+        h('td', { class: 'num' }, fineMoney(item.cost_usd)),
+        h('td', {}, jobResult(item))))))
       : h('p', { class: 'muted small' }, 'No jobs yet. Submit one above or through the API.'));
 
   const apiCard = h('div', { class: 'card' }, h('h2', {}, 'Use the API'),
     h('pre', {}, `curl -X POST ${location.origin}/v1/jobs \\\n  -H "authorization: Bearer <your API key>" \\\n  -H "content-type: application/json" \\\n  -d '{"type":"transcribe","input":{"audio_url":"https://…/audio.mp3","model":"small"}}'\n\ncurl ${location.origin}/v1/jobs/<job id> -H "authorization: Bearer <your API key>"`));
 
-  if (jobs.some((j) => j.status === 'queued' || j.status === 'running')) pollTimer = setTimeout(render, 5000);
-  return [h('div', { class: 'grid' }, balanceCard(me), submitCard), jobsCard, h('div', { class: 'grid' }, await apiKeysCard(me), apiCard), await ledgerCard(), dangerCard()];
+  if (jobs.some((j) => j.status === 'queued' || j.status === 'running')) pollTimer = setTimeout(render, 2000);
+  return [h('div', { class: 'grid' }, balanceCard(me), submitCard), networkCard(), jobsCard, h('div', { class: 'grid' }, await apiKeysCard(me), apiCard), await ledgerCard(), dangerCard()];
+}
+
+// Reads an audio file's length in the browser (metadata only, no full download).
+function audioDuration(url) {
+  return new Promise((resolve, reject) => {
+    const a = new Audio();
+    const fail = (msg) => { clearTimeout(timer); a.src = ''; reject(new Error(msg)); };
+    const timer = setTimeout(() => fail('Timed out reading the audio length. Try "1 machine".'), 15000);
+    a.preload = 'metadata';
+    a.onloadedmetadata = () => {
+      clearTimeout(timer);
+      if (Number.isFinite(a.duration) && a.duration > 0) resolve(a.duration);
+      else fail('Could not read the audio length. Try "1 machine".');
+    };
+    a.onerror = () => fail('The browser could not open this audio to measure it. Try "1 machine".');
+    a.src = url;
+  });
+}
+
+// Collapses chunk jobs that share input.group into one item, keeping list order.
+function groupJobs(jobs) {
+  const out = [];
+  const groups = new Map();
+  for (const j of jobs) {
+    const g = j.input?.group;
+    if (!g) { out.push(j); continue; }
+    if (!groups.has(g)) { const item = { group: g, chunks: [] }; groups.set(g, item); out.push(item); }
+    groups.get(g).chunks.push(j);
+  }
+  return out;
+}
+
+// Reduce step: shows progress across machines and the transcript stitched in time order.
+function groupRow({ chunks }) {
+  chunks.sort((a, b) => a.input.clip_start_s - b.input.clip_start_s);
+  const done = chunks.filter((c) => c.status === 'succeeded');
+  const machines = [...new Set(chunks.map((c) => c.worker_name).filter(Boolean))];
+  const allDone = done.length === chunks.length;
+  const failed = chunks.some((c) => c.status === 'failed' || c.status === 'canceled');
+  const created = Math.min(...chunks.map((c) => new Date(c.created_at)));
+  const finished = allDone ? Math.max(...chunks.map((c) => new Date(c.finished_at))) : null;
+  const audio = chunks[chunks.length - 1].input.clip_end_s;
+  const cost = done.reduce((s, c) => s + (c.cost_usd || 0), 0);
+  const status = failed ? 'failed' : allDone ? 'succeeded' : 'running';
+
+  const perChunk = h('table', {}, h('tr', {}, h('th', {}, 'Chunk'), h('th', {}, 'Machine'), h('th', {}, 'Status'), h('th', { class: 'num' }, 'Took')),
+    ...chunks.map((c, i) => h('tr', {},
+      h('td', {}, `#${i + 1} ${c.input.clip_start_s.toFixed(0)}–${c.input.clip_end_s.toFixed(0)} s`),
+      h('td', {}, c.worker_name || '—'),
+      h('td', {}, pill(c.status)),
+      h('td', { class: 'num' }, c.started_at && c.finished_at ? `${((new Date(c.finished_at) - new Date(c.started_at)) / 1000).toFixed(1)} s` : '—'))));
+  const merged = done.length ? chunks.map((c) => c.output?.text || '…').join(' ') : '';
+
+  return h('tr', {},
+    h('td', {}, when(chunks[0].created_at)),
+    h('td', {}, 'transcribe', h('div', { class: 'muted small' }, `split ${chunks.length} ways · ${chunks[0].input.model ?? 'small'}`)),
+    h('td', {}, pill(status), h('div', { class: 'muted small' }, `${done.length}/${chunks.length} chunks · ${machines.length} machine${machines.length === 1 ? '' : 's'}`)),
+    h('td', { class: 'num' }, fineMoney(cost)),
+    h('td', {},
+      h('div', { class: 'small' }, finished ? `Done in ${((finished - created) / 1000).toFixed(1)} s for ${Math.round(audio)} s of audio` : 'Working…'),
+      h('details', {}, h('summary', {}, 'Chunks by machine'), perChunk),
+      merged ? h('details', {}, h('summary', {}, allDone ? 'Merged transcript' : 'Partial transcript'), h('pre', {}, merged),
+        h('button', { onclick: () => navigator.clipboard.writeText(merged).then(() => toast('Copied.')) }, 'Copy')) : null));
 }
 
 function jobResult(j) {
@@ -250,7 +369,7 @@ async function hostView(me) {
       ...payouts.map((p) => h('tr', {}, h('td', {}, when(p.created_at)), h('td', {}, p.destination), h('td', {}, pill(p.status), p.admin_note ? h('div', { class: 'muted small' }, p.admin_note) : null), h('td', { class: 'num' }, money(p.amount_usd)))))
       : h('p', { class: 'muted small' }, 'No payouts yet.'));
 
-  return [h('div', { class: 'grid' }, balanceCard(me), payoutCard), workersCard, h('div', { class: 'grid' }, setupCard, await apiKeysCard(me)), payoutsCard, await ledgerCard(), dangerCard()];
+  return [h('div', { class: 'grid' }, balanceCard(me), payoutCard), networkCard(), workersCard, h('div', { class: 'grid' }, setupCard, await apiKeysCard(me)), payoutsCard, await ledgerCard(), dangerCard()];
 }
 
 // ---------- shell ----------

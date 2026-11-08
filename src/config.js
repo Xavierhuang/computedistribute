@@ -24,6 +24,8 @@ module.exports = {
   reaperIntervalMs: intEnv('REAPER_INTERVAL_MS', 10_000),
   // Share of successful jobs re-run on another host to check the result.
   verifyRate: rateEnv('VERIFY_RATE', 0.05),
+  // Demo mode: free credit for new buyers and an "add demo credit" button (0 = off).
+  demoCreditUsd: Number(process.env.DEMO_CREDIT_USD || 0),
   // Enables /v1/admin. Use a long random value.
   adminToken: process.env.ADMIN_TOKEN || null,
   // Card top-ups are enabled only when both Stripe values are set.

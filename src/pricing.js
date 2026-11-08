@@ -16,8 +16,9 @@ const pricing = {
     validateOutput: () => null,
   },
   transcribe: {
-    // Reserve enough for the longest audio a host will accept; the unused part is released.
-    hold: (input) => Math.ceil((MAX_AUDIO_SECONDS / 60) * rate(input)),
+    // Reserve enough for the longest audio a host will accept (or the clip, when one is
+    // given, plus 2 s of slack); the unused part is released.
+    hold: (input) => Math.ceil((clipSeconds(input) ?? MAX_AUDIO_SECONDS) / 60 * rate(input)),
     cost: (input, output) => Math.ceil((Math.min(output.duration_s, MAX_AUDIO_SECONDS) / 60) * rate(input)),
     validateOutput(output) {
       if (output === null || typeof output !== 'object' || Array.isArray(output)) return 'output must be an object';
@@ -30,6 +31,10 @@ const pricing = {
     },
   },
 };
+
+function clipSeconds(input) {
+  return input.clip_end_s === undefined ? null : input.clip_end_s - input.clip_start_s + 2;
+}
 
 function rate(input) {
   return TRANSCRIBE_MICROS_PER_MINUTE[input.model ?? DEFAULT_TRANSCRIBE_MODEL];

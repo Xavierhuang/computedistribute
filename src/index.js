@@ -23,6 +23,7 @@ async function main() {
     verifyRate: config.verifyRate,
     adminToken: config.adminToken,
     stripeBilling,
+    demoCreditUsd: config.demoCreditUsd,
     cookieSecure: config.cookieSecure,
     trustProxy: config.trustProxy,
   });

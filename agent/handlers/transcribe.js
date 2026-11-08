@@ -43,6 +43,7 @@ function createTranscribeHandler({ python, maxBytes, allowPrivateUrls = false, d
       await download(input.audio_url, audioPath, { maxBytes, allowPrivate: allowPrivateUrls, signal });
       const args = [SCRIPT, audioPath, '--model', input.model ?? 'small', '--task', input.task ?? 'transcribe', '--device', device];
       if (input.language) args.push('--language', input.language);
+      if (input.clip_start_s !== undefined) args.push('--clip-start', String(input.clip_start_s), '--clip-end', String(input.clip_end_s));
       const stdout = await runPython(python, args, { signal });
       try {
         return JSON.parse(stdout);

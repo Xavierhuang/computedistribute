@@ -354,3 +354,52 @@ test('public: pricing and dashboard are served', async () => {
   assert.match(page.headers.get('content-type'), /text\/html/);
   assert.match(page.headers.get('content-security-policy'), /default-src 'self'/);
 });
+
+// ---------- Hackathon demo features ----------
+
+test('chunks: clip ranges validate, hold only the clip, and show which machine ran them', async () => {
+  const buyer = await account('buyer', { credit: 1 });
+  const host = await account('host');
+  const w = await worker(plain, host);
+  const bad = [{ clip_start_s: 5 }, { clip_start_s: 10, clip_end_s: 5 }, { clip_start_s: -1, clip_end_s: 5 }, { clip_start_s: 0, clip_end_s: 5, group: 'bad group!' }];
+  for (const extra of bad) assert.equal((await submit(plain, buyer, { audio_url: AUDIO, ...extra })).status, 400, JSON.stringify(extra));
+
+  const chunk = await submit(plain, buyer, { audio_url: AUDIO, clip_start_s: 60, clip_end_s: 120, group: 'g1' });
+  assert.equal(chunk.status, 201);
+  assert.equal(chunk.body.hold_usd, 0.002067, '62 s × $0.002/min, rounded up to the micro-dollar');
+  const c = await claim(plain, host, w);
+  await complete(plain, host, c.body.lease_id, transcript('chunk two', 60));
+  const listed = (await call(plain, buyer, 'GET', '/v1/jobs')).body.jobs[0];
+  assert.equal(listed.worker_name, 'w');
+  assert.equal(listed.cost_usd, 0.002);
+});
+
+test('demo mode: new buyers get credit and can top up for free', async () => {
+  const demo = await start({ demoCreditUsd: 5 });
+  const s = await call(demo, null, 'POST', '/v1/auth/signup', { email: 'judge@example.com', password: 'judge password', kind: 'buyer' });
+  const session = { cookie: s.cookie };
+  const me = await call(demo, session, 'GET', '/v1/me');
+  assert.equal(me.body.balance_usd, 5);
+  assert.equal(me.body.demo_credit_usd, 5);
+  assert.equal((await call(demo, session, 'POST', '/v1/me/demo-credit', {})).body.balance_usd, 10);
+  await call(demo, session, 'POST', '/v1/me/demo-credit', {});
+  await call(demo, session, 'POST', '/v1/me/demo-credit', {});
+  assert.equal((await call(demo, session, 'POST', '/v1/me/demo-credit', {})).body.error, 'enough_credit', 'capped at 4× the demo amount');
+  const host = await call(demo, null, 'POST', '/v1/auth/signup', { email: 'h@example.com', password: 'host password', kind: 'host' });
+  assert.equal((await call(demo, { cookie: host.cookie }, 'GET', '/v1/me')).body.balance_usd, 0, 'hosts get no free credit');
+  assert.equal((await call(plain, session, 'POST', '/v1/me/demo-credit', {})).status, 404, 'off unless DEMO_CREDIT_USD is set');
+});
+
+test('network: public view of online machines and job flow', async () => {
+  const buyer = await account('buyer', { credit: 1 });
+  const host = await account('host');
+  const w = await worker(plain, host);
+  await submit(plain, buyer);
+  await submit(plain, buyer);
+  await claim(plain, host, w);
+  const n = (await call(plain, null, 'GET', '/v1/network')).body;
+  assert.equal(n.workers_online.length, 1);
+  assert.equal(n.workers_online[0].running, 1);
+  assert.equal(n.running, 1);
+  assert.equal(n.queued, 1);
+});

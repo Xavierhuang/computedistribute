@@ -33,6 +33,17 @@ function publicHttpUrlProblem(value, field) {
   return null;
 }
 
+// Optional time range, so one long recording can be split into chunks that run on
+// different machines in parallel (the dashboard merges them by clip_start_s).
+function clipProblem(input) {
+  const { clip_start_s: start, clip_end_s: end } = input;
+  if (start === undefined && end === undefined) return null;
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || end > 4 * 3600) {
+    return 'clip_start_s and clip_end_s must be given together, with 0 ≤ start < end ≤ 14400';
+  }
+  return null;
+}
+
 const jobTypes = {
   // Returns its input unchanged. Proves the claim → run → complete loop end to end.
   echo: {
@@ -42,8 +53,11 @@ const jobTypes = {
   // Speech-to-text with Whisper. Output: { text, language, duration_s, segments[] }.
   transcribe: {
     validate(input) {
-      return onlyKeys(input, ['audio_url', 'model', 'language', 'task'])
+      return onlyKeys(input, ['audio_url', 'model', 'language', 'task', 'clip_start_s', 'clip_end_s', 'group'])
         || publicHttpUrlProblem(input.audio_url, 'audio_url')
+        || clipProblem(input)
+        || (input.group !== undefined && (typeof input.group !== 'string' || !/^[\w-]{1,64}$/.test(input.group))
+          ? 'group must be 1–64 letters, digits, - or _' : null)
         || (input.model !== undefined && !Object.hasOwn(WHISPER_MODELS, input.model)
           ? `model must be one of: ${Object.keys(WHISPER_MODELS).join(', ')}` : null)
         || (input.language !== undefined && !/^[a-z]{2,3}$/.test(input.language)

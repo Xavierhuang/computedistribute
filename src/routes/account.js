@@ -2,7 +2,7 @@
 // for balance, ledger, API keys, top-ups, workers, payouts and account deletion.
 const express = require('express');
 const auth = require('../auth');
-const { balanceMicros, listEntries } = require('../ledger');
+const { balanceMicros, listEntries, addEntry } = require('../ledger');
 const { listHostWorkers } = require('../queue');
 const { requestPayout, listPayouts, toPublicPayout, PayoutError } = require('../payouts');
 const { usd } = require('../pricing');
@@ -20,7 +20,9 @@ function parseCredentials(body = {}) {
   return { email, password: body.password };
 }
 
-function accountRouter({ pool, cookieSecure, stripeBilling }) {
+function accountRouter({ pool, cookieSecure, stripeBilling, demoCreditUsd = 0 }) {
+  const demoMicros = Math.round(demoCreditUsd * 1e6);
+  const grantDemo = (accountId) => addEntry(pool, { accountId, amountMicros: demoMicros, kind: 'grant', memo: 'Demo credit' });
   const r = express.Router();
   const signupLimiter = createRateLimiter({ limit: 20, windowMs: 60 * 60_000 });
   const loginLimiter = createRateLimiter({ limit: 10, windowMs: 15 * 60_000 });
@@ -39,6 +41,7 @@ function accountRouter({ pool, cookieSecure, stripeBilling }) {
     const name = requiredString(req.body.name ?? email.split('@')[0], 'name', 100);
     const result = await auth.createUser(pool, { email, password, name, kind });
     if (result.error === 'email_taken') return res.status(409).json({ error: 'email_taken' });
+    if (demoMicros > 0 && kind === 'buyer') await grantDemo(result.account.id);
     await startSession(res, result.user.id);
     res.status(201).json({ account: { id: result.account.id, name: result.account.name, kind: result.account.kind }, email });
   }));
@@ -76,7 +79,18 @@ function accountRouter({ pool, cookieSecure, stripeBilling }) {
       email: req.user?.email ?? null,
       balance_usd: usd(await balanceMicros(pool, a.id)),
       topups_enabled: Boolean(stripeBilling),
+      demo_credit_usd: demoMicros > 0 ? demoCreditUsd : 0,
     });
+  }));
+
+  // Demo mode only: buyers running low can add more free credit (up to 4× the demo amount).
+  me.post('/demo-credit', onlyKind('buyer'), wrap(async (req, res) => {
+    if (demoMicros <= 0) return res.status(404).json({ error: 'not_found' });
+    if ((await balanceMicros(pool, req.account.id)) >= 4 * demoMicros) {
+      return res.status(400).json({ error: 'enough_credit', message: 'you already have plenty of demo credit' });
+    }
+    await grantDemo(req.account.id);
+    res.status(201).json({ balance_usd: usd(await balanceMicros(pool, req.account.id)) });
   }));
 
   me.get('/ledger', wrap(async (req, res) => {

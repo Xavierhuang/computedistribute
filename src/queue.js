@@ -32,6 +32,7 @@ function toPublicJob(row) {
     max_attempts: row.max_attempts,
     hold_usd: usd(row.hold_micros ?? 0),
     cost_usd: row.cost_micros == null ? null : usd(row.cost_micros),
+    worker_name: row.worker_name,
     created_at: row.created_at,
     started_at: row.started_at,
     finished_at: row.finished_at,
@@ -80,8 +81,9 @@ async function getBuyerJob(pool, buyerId, jobId) {
 
 async function listBuyerJobs(pool, buyerId, { status = null, limit = 20 }) {
   const { rows } = await pool.query(
-    `SELECT * FROM jobs WHERE buyer_id = $1 AND ($2::text IS NULL OR status = $2)
-     ORDER BY created_at DESC LIMIT $3`,
+    `SELECT j.*, w.name AS worker_name FROM jobs j LEFT JOIN workers w ON w.id = j.worker_id
+     WHERE j.buyer_id = $1 AND ($2::text IS NULL OR j.status = $2)
+     ORDER BY j.created_at DESC LIMIT $3`,
     [buyerId, status, limit],
   );
   return rows;
