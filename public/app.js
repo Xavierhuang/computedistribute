@@ -63,16 +63,14 @@ function field(label, input) {
 // ---------- live network ----------
 
 let netTimer = null;
+let lastNetwork = null;
 
 // Machines online and job flow, refreshed every 3 s. One timer for the whole page.
 function networkCard() {
   clearInterval(netTimer);
   const body = h('div', {}, h('p', { class: 'muted small' }, 'Loading…'));
   const card = h('div', { class: 'card' }, h('h2', {}, 'Live network'), body);
-  async function refresh() {
-    if (!card.isConnected && netTimer) return clearInterval(netTimer);
-    try {
-      const n = await api('GET', '/v1/network');
+  function paint(n) {
       body.replaceChildren(
         h('div', { class: 'row' },
           h('span', { class: 'big' }, String(n.workers_online.length)), h('span', { class: 'muted' }, 'machines online ·'),
@@ -84,8 +82,12 @@ function networkCard() {
             ...n.workers_online.map((w) => h('tr', {}, h('td', {}, w.name), h('td', {}, pill(w.running ? 'running' : 'online')),
               h('td', { class: 'num' }, `${w.vram_gb} GB`), h('td', { class: 'num' }, w.done_last_hour))))
           : h('p', { class: 'muted small' }, 'No machines online right now.'));
-    } catch { /* keep the last view */ }
   }
+  async function refresh() {
+    if (!card.isConnected && netTimer) return clearInterval(netTimer);
+    try { lastNetwork = await api('GET', '/v1/network'); paint(lastNetwork); } catch { /* keep the last view */ }
+  }
+  if (lastNetwork) paint(lastNetwork);
   refresh();
   netTimer = setInterval(refresh, 3000);
   return card;
@@ -306,7 +308,7 @@ function groupRow({ chunks }) {
   const perChunk = h('table', {}, h('tr', {}, h('th', {}, 'Chunk'), h('th', {}, 'Machine'), h('th', {}, 'Status'), h('th', { class: 'num' }, 'Took')),
     ...chunks.map((c, i) => h('tr', {},
       h('td', {}, `#${i + 1} ${c.input.clip_start_s.toFixed(0)}–${c.input.clip_end_s.toFixed(0)} s`),
-      h('td', {}, c.worker_name || '—'),
+      h('td', {}, c.worker_name || '—', c.attempts > 1 ? h('div', { class: 'muted small' }, `retried (attempt ${c.attempts})`) : null),
       h('td', {}, pill(c.status)),
       h('td', { class: 'num' }, c.started_at && c.finished_at ? `${((new Date(c.finished_at) - new Date(c.started_at)) / 1000).toFixed(1)} s` : '—'))));
   const merged = done.length ? chunks.map((c) => c.output?.text || '…').join(' ') : '';
@@ -318,8 +320,8 @@ function groupRow({ chunks }) {
     h('td', { class: 'num' }, fineMoney(cost)),
     h('td', {},
       h('div', { class: 'small' }, finished ? `Done in ${((finished - created) / 1000).toFixed(1)} s for ${Math.round(audio)} s of audio` : 'Working…'),
-      h('details', {}, h('summary', {}, 'Chunks by machine'), perChunk),
-      merged ? h('details', {}, h('summary', {}, allDone ? 'Merged transcript' : 'Partial transcript'), h('pre', {}, merged),
+      h('details', { 'data-key': `${chunks[0].input.group}-chunks` }, h('summary', {}, 'Chunks by machine'), perChunk),
+      merged ? h('details', { 'data-key': `${chunks[0].input.group}-merged` }, h('summary', {}, allDone ? 'Merged transcript' : 'Partial transcript'), h('pre', {}, merged),
         h('button', { onclick: () => navigator.clipboard.writeText(merged).then(() => toast('Copied.')) }, 'Copy')) : null));
 }
 
@@ -327,7 +329,7 @@ function jobResult(j) {
   if (j.status === 'succeeded' && j.output) {
     const text = typeof j.output.text === 'string' ? j.output.text : JSON.stringify(j.output, null, 2);
     const meta = j.output.duration_s != null ? `${Math.round(j.output.duration_s)} s · ${j.output.language ?? ''}` : '';
-    return h('details', {}, h('summary', {}, meta ? `Show transcript (${meta})` : 'Show output'),
+    return h('details', { 'data-key': `${j.id}-out` }, h('summary', {}, meta ? `Show transcript (${meta})` : 'Show output'),
       h('pre', {}, text),
       h('button', { onclick: () => navigator.clipboard.writeText(text).then(() => toast('Copied.')) }, 'Copy'));
   }
@@ -394,7 +396,12 @@ async function render() {
   if (me.account.suspended) banners.push(h('div', { class: 'banner bad' }, `This account is suspended: ${me.account.suspended_reason || 'contact support'}.`));
 
   const body = me.account.kind === 'host' ? await hostView(me) : await buyerView(me);
+  // Re-rendering replaces the page; keep the reader's place and any sections they opened.
+  const scrollY = window.scrollY;
+  const open = new Set([...document.querySelectorAll('details[open][data-key]')].map((d) => d.dataset.key));
   $app.replaceChildren(...banners, ...body);
+  for (const d of document.querySelectorAll('details[data-key]')) if (open.has(d.dataset.key)) d.open = true;
+  window.scrollTo(0, scrollY);
 }
 
 async function boot() {

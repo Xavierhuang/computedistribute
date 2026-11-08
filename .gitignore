@@ -4,3 +4,4 @@ node_modules/
 dist/
 coverage/
 .pgdata/
+demo-video/
